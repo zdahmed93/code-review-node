@@ -1,0 +1,4 @@
+.git
+.review-repos
+reviews/*.md
+**/.DS_Store

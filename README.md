@@ -139,6 +139,109 @@ Generated **`reviews/*.md`** files are listed in **`.gitignore`** so they are no
 
 Private repositories use whatever credentials your **git** setup provides (SSH agent, credential helper, etc.).
 
+## Docker
+
+Build (needs network to download the Kiro CLI installer):
+
+```bash
+docker build -t code-review-node .
+```
+
+Run (pass CLI args after the image name):
+
+```bash
+docker run --rm code-review-node --help
+docker run --rm code-review-node owner/repo-name
+```
+
+Persist **`reviews/`** on the host and reuse **Kiro login data** from your machine (typical paths: Linux/macOS `~/.kiro`; the CLI binary is already in the image):
+
+```bash
+docker run --rm \
+  -v "$HOME/.kiro:/root/.kiro:ro" \
+  -v "$(pwd)/reviews-out:/app/reviews" \
+  code-review-node owner/repo-name
+```
+
+Use **read/write** on `~/.kiro` if the CLI must refresh tokens (`:rw` instead of `:ro`).
+
+Private Git repos via SSH (mount keys; tighten permissions on the host):
+
+```bash
+docker run --rm \
+  -v "$HOME/.ssh:/root/.ssh:ro" \
+  -v "$HOME/.kiro:/root/.kiro:ro" \
+  -v "$(pwd)/reviews-out:/app/reviews" \
+  code-review-node git@github.com:org/private-repo.git
+```
+
+If the image build fails at the Kiro install step (architecture, air‑gapped build, etc.), install Kiro inside a running container interactively or switch to a host install and run Node without Docker.
+
+## Running on AWS EC2 (example)
+
+These steps assume an **Ubuntu 22.04/24.04** or **Amazon Linux 2023** instance with outbound HTTPS (clone + Kiro).
+
+### 1. Install Docker on the instance
+
+**Ubuntu**
+
+```bash
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl git
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "${VERSION_CODENAME:-$VERSION}") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io
+sudo usermod -aG docker "$USER"
+# Log out and back in so `docker` works without sudo
+```
+
+**Amazon Linux 2023**
+
+```bash
+sudo dnf install -y docker git
+sudo systemctl enable --now docker
+sudo usermod -aG docker ec2-user
+# Log out and back in
+```
+
+### 2. Put the app on the server
+
+```bash
+git clone <your-fork-or-repo-url> code-review-node
+cd code-review-node
+docker build -t code-review-node .
+```
+
+### 3. Kiro authentication on a headless server
+
+The Kiro CLI must be **logged in** before `--no-interactive` reviews work. Practical options:
+
+- **Copy credentials from your laptop** (after `kiro-cli login` locally): copy the `~/.kiro` directory to the instance (e.g. `scp -r ~/.kiro ec2-user@<host>:~/.kiro`), then mount it read-only or read-write as in the Docker examples above.
+- **Run a one-off interactive login** on the instance (the image entrypoint is the review CLI, so override it):  
+  `docker run -it --rm --entrypoint bash -v "$HOME/.kiro:/root/.kiro" code-review-node -lc 'kiro-cli login && kiro-cli whoami'`
+
+Check [Kiro CLI authentication](https://kiro.dev/docs/cli/) for the current recommended flow.
+
+### 4. Example review run on EC2
+
+```bash
+mkdir -p ~/reviews-out
+docker run --rm \
+  -v "$HOME/.kiro:/root/.kiro:ro" \
+  -v "$HOME/reviews-out:/app/reviews" \
+  code-review-node expressjs/express
+ls ~/reviews-out
+```
+
+### 5. Security notes for production use
+
+- Restrict **security groups** (SSH from known IPs only).
+- Prefer **IAM instance roles** for AWS API access where applicable; Kiro may still need its own subscription/login.
+- Do not bake **SSH private keys** or **`~/.kiro`** into the image; mount at runtime or use a secrets manager.
+- For **private GitHub** repos, use a **deploy key** or **PAT** with minimal scope; mount `~/.ssh` or configure `git credential` in a mounted volume.
+
 ## License
 
 MIT
