@@ -62,6 +62,11 @@ Options:
   --prompt <text>      Review instructions (overrides default markdown file)
   --prompt-file <path> Read review instructions from a file (overrides default markdown file)
   --output <path>      Write report markdown here (default: reviews/<slug>-<timestamp>.md in this package)
+  --github-pr          After review, commit the report in the reviewed repo and open a new PR (GitHub only)
+  --github-token <t>   PAT for --github-pr (default: env GITHUB_TOKEN); needs repo push + pull_requests
+  --pr-base <branch>   PR target branch (default: GitHub default branch for the repo)
+  --pr-title <text>    PR title (default: automated code review title)
+  --pr-file <path>     Path for the report inside the repo (default: docs/code-reviews/<slug>-<ts>.md)
   --timeout <sec>      Send SIGTERM to Kiro after N seconds (0 = no limit)
   -h, --help           Show this help
 `);
@@ -187,6 +192,195 @@ function run(cmd, args, options) {
   });
 }
 
+function runCapture(cmd, args, options) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, {
+      ...options,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
+    child.stdout?.on("data", (c) => {
+      stdout += c;
+    });
+    child.stderr?.on("data", (c) => {
+      stderr += c;
+    });
+    child.on("error", reject);
+    child.on("close", (code, signal) => {
+      resolve({ code: code ?? 1, signal, stdout, stderr });
+    });
+  });
+}
+
+function parseGithubOwnerRepoFromUrl(url) {
+  if (!url || typeof url !== "string") return null;
+  const trimmed = url.trim();
+  const ssh = trimmed.match(/^git@github\.com:([^/]+)\/([^/]+?)(?:\.git)?$/i);
+  if (ssh) return { owner: ssh[1], repo: ssh[2] };
+  const normalized = trimmed.replace(/^git@github\.com:/i, "https://github.com/");
+  try {
+    const u = new URL(normalized);
+    if (u.hostname.toLowerCase() !== "github.com") return null;
+    const parts = u.pathname.split("/").filter(Boolean);
+    if (parts.length < 2) return null;
+    return {
+      owner: parts[0],
+      repo: parts[1].replace(/\.git$/i, ""),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function resolveGithubRepo(repoDir, cloneUrl) {
+  if (cloneUrl) {
+    const fromClone = parseGithubOwnerRepoFromUrl(cloneUrl);
+    if (fromClone) return fromClone;
+  }
+  const cap = await runCapture("git", ["remote", "get-url", "origin"], { cwd: repoDir });
+  if (cap.code !== 0) return null;
+  return parseGithubOwnerRepoFromUrl(cap.stdout.trim());
+}
+
+async function githubApi(method, path, token, body) {
+  const res = await fetch(`https://api.github.com${path}`, {
+    method,
+    headers: {
+      Accept: "application/vnd.github+json",
+      Authorization: `Bearer ${token}`,
+      "X-GitHub-Api-Version": "2022-11-28",
+      ...(body ? { "Content-Type": "application/json" } : {}),
+    },
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  let json;
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch {
+    json = { message: text };
+  }
+  if (!res.ok) {
+    const msg = json?.message || text || res.statusText;
+    throw new Error(`GitHub API ${method} ${path}: ${res.status} ${msg}`);
+  }
+  return json;
+}
+
+function sanitizeGitBranchName(s) {
+  const t = s.replace(/[^a-zA-Z0-9._/-]+/g, "-").replace(/^-+|-+$/g, "");
+  const without = t.replace(/^\/+|\/+$/g, "").replace(/\/\/+/g, "/");
+  return without.slice(0, 200) || "code-review";
+}
+
+function formatGitPushFailureMessage(combined, owner, repo, branchSlug, repoDir) {
+  const base = `git push failed: ${combined || "(no stderr)"}`;
+  if (!/403|401|denied|Permission|unable to access/i.test(combined)) {
+    return base;
+  }
+  return `${base}
+
+Why: GitHub accepted the token but refused to push to ${owner}/${repo} (wrong/expired token, read-only scopes, or SSO not authorized).
+
+Try:
+  • Classic PAT: enable the "repo" scope (not only "public_read").
+  • Fine-grained PAT: grant this repository; set Contents + Pull requests to Read and write.
+  • Org-owned repo: Developer settings → your token → Authorize SSO for that organization.
+  • If GITHUB_TOKEN is set by CI or another tool, it may be read-only — use --github-token with a personal PAT.
+
+Your review commit exists only locally. After fixing the token, push that branch, e.g.:
+  cd ${repoDir}
+  git push "https://x-access-token:<YOUR_PAT>@github.com/${owner}/${repo}.git" "HEAD:refs/heads/${branchSlug}"
+`;
+}
+
+/**
+ * Commit report inside repoDir, push branch, open PR. Requires push access to github.com/{owner}/{repo}.
+ */
+async function createGithubPullRequestForReview({
+  repoDir,
+  cloneUrl,
+  reportMd,
+  slug,
+  token,
+  prBase,
+  prTitle,
+  prFileInRepo,
+}) {
+  const gitDir = await runCapture("git", ["rev-parse", "--git-dir"], { cwd: repoDir });
+  if (gitDir.code !== 0) {
+    throw new Error("--github-pr needs a git repository (clone a repo or use a git working tree).");
+  }
+
+  const gh = await resolveGithubRepo(repoDir, cloneUrl);
+  if (!gh) {
+    throw new Error(
+      "--github-pr only works for github.com repositories (clone URL or git remote origin).",
+    );
+  }
+
+  const { owner, repo } = gh;
+  const repoMeta = await githubApi("GET", `/repos/${owner}/${repo}`, token);
+  const baseBranch = (prBase?.trim() || repoMeta.default_branch || "main").trim();
+
+  const branchSlug = sanitizeGitBranchName(`code-review/${slug}-${fsSafeTimestamp()}`);
+  const fileRel = prFileInRepo.trim().replace(/\\/g, "/").replace(/^\/+/, "");
+  const absFile = join(repoDir, fileRel);
+  await mkdir(dirname(absFile), { recursive: true });
+  await writeFile(absFile, reportMd, "utf8");
+
+  const gitName = process.env.KIRO_REVIEW_GIT_NAME || "code-review-bot";
+  const gitEmail = process.env.KIRO_REVIEW_GIT_EMAIL || "code-review-bot@users.noreply.github.com";
+  await run("git", ["-C", repoDir, "config", "user.name", gitName], { env: process.env });
+  await run("git", ["-C", repoDir, "config", "user.email", gitEmail], { env: process.env });
+
+  await run("git", ["-C", repoDir, "checkout", "-b", branchSlug], { env: process.env });
+  await run("git", ["-C", repoDir, "add", "--", fileRel], { env: process.env });
+  await run(
+    "git",
+    ["-C", repoDir, "commit", "-m", `docs: add automated code review report\n\n${fileRel}`],
+    { env: process.env },
+  );
+
+  const authedPushUrl = `https://x-access-token:${encodeURIComponent(token)}@github.com/${owner}/${repo}.git`;
+  const pushResult = await runCapture(
+    "git",
+    ["-C", repoDir, "push", authedPushUrl, `HEAD:refs/heads/${branchSlug}`],
+    { env: process.env },
+  );
+  if (pushResult.code !== 0) {
+    const combined = `${pushResult.stderr}\n${pushResult.stdout}`.trim();
+    throw new Error(formatGitPushFailureMessage(combined, owner, repo, branchSlug, repoDir));
+  }
+
+  const title =
+    prTitle?.trim() ||
+    `chore: automated code review report (${new Date().toISOString().slice(0, 10)})`;
+  const maxBody = 60000;
+  const intro = `Automated code review (Kiro CLI).\n\n**Report file:** \`${fileRel}\`\n\n---\n\n`;
+  let body = intro + reportMd;
+  if (body.length > maxBody) {
+    body =
+      intro +
+      "_Full report is in the committed file above; body truncated for GitHub limits._\n\n" +
+      reportMd.slice(0, maxBody - intro.length - 200) +
+      "\n\n…";
+  }
+
+  const pr = await githubApi("POST", `/repos/${owner}/${repo}/pulls`, token, {
+    title,
+    head: branchSlug,
+    base: baseBranch,
+    body,
+  });
+
+  console.error(`Opened pull request: ${pr.html_url}`);
+  return pr.html_url;
+}
+
 async function pathExists(p) {
   try {
     await access(p, fsConstants.F_OK);
@@ -234,6 +428,11 @@ async function main() {
       prompt: { type: "string" },
       "prompt-file": { type: "string" },
       output: { type: "string" },
+      "github-pr": { type: "boolean", default: false },
+      "github-token": { type: "string" },
+      "pr-base": { type: "string" },
+      "pr-title": { type: "string" },
+      "pr-file": { type: "string" },
       timeout: { type: "string" },
       help: { type: "boolean", short: "h", default: false },
     },
@@ -364,11 +563,40 @@ async function main() {
   await writeFile(reportPath, reportMd, "utf8");
   console.error(`Wrote review report: ${reportPath}`);
 
+  let exitCode = kiroSignal ? 1 : (kiroExitCode ?? 1);
+
+  if (values["github-pr"]) {
+    const token = values["github-token"]?.trim() || process.env.GITHUB_TOKEN?.trim();
+    if (!token) {
+      console.error("Missing GitHub token: set GITHUB_TOKEN or pass --github-token (needs repo push).");
+      exitCode = 1;
+    } else {
+      const prFileInRepo =
+        values["pr-file"]?.trim().replace(/\\/g, "/") ||
+        `docs/code-reviews/${slug}-${fsSafeTimestamp()}.md`;
+      try {
+        await createGithubPullRequestForReview({
+          repoDir,
+          cloneUrl,
+          reportMd,
+          slug,
+          token,
+          prBase: values["pr-base"],
+          prTitle: values["pr-title"],
+          prFileInRepo,
+        });
+      } catch (e) {
+        console.error(e instanceof Error ? e.message : e);
+        exitCode = 1;
+      }
+    }
+  }
+
   if (cleanupDir) {
     await rm(cleanupDir, { recursive: true, force: true }).catch(() => {});
   }
 
-  process.exit(kiroSignal ? 1 : (kiroExitCode ?? 1));
+  process.exit(exitCode);
 }
 
 function isMainModule() {

@@ -101,6 +101,11 @@ kiro-repo-review --prompt-file ./prompts/security.md owner/repo
 | `--prompt <text>` | Inline review instructions (overrides default markdown) |
 | `--prompt-file <path>` | Read review instructions from any file (overrides default markdown) |
 | `--output <path>` | Save the transcript markdown here (default: **`reviews/<slug>-<timestamp>.md`**) |
+| `--github-pr` | After the review, commit the report into the **reviewed** GitHub repo and open a **new pull request** |
+| `--github-token <t>` | GitHub PAT for `--github-pr` (default: **`GITHUB_TOKEN`** env) |
+| `--pr-base <branch>` | PR base branch (default: repo’s **default branch** from the API) |
+| `--pr-title <text>` | PR title (default: dated “automated code review report” title) |
+| `--pr-file <path>` | Path inside the reviewed repo for the markdown file (default: **`docs/code-reviews/<slug>-<timestamp>.md`**) |
 | `--timeout <sec>` | Send `SIGTERM` to Kiro after *N* seconds (`0` = no limit) |
 | `-h`, `--help` | Show help |
 
@@ -126,6 +131,38 @@ The file includes metadata (time, path reviewed, source, exit status) plus captu
 
 Generated **`reviews/*.md`** files are listed in **`.gitignore`** so they are not committed by default. The empty **`reviews/.gitkeep`** keeps the folder in the repo.
 
+## Open a pull request on the reviewed repo (`--github-pr`)
+
+For **github.com** repositories only: after Kiro finishes, the tool can **add the report as a new file** on a branch `code-review/<slug>-<timestamp>`, **push** it (HTTPS with your token), and **open a PR** against the default branch (or `--pr-base`).
+
+```bash
+export GITHUB_TOKEN=ghp_...   # classic PAT: repo scope; or fine-grained: Contents + Pull requests write
+kiro-repo-review --github-pr owner/repo-name
+```
+
+With **`--local`**, `origin` must point at **github.com** so the owner/repo can be resolved.
+
+**Requirements**
+
+- Token must allow **push** to the target repo (your repo, org repo with permission, or a bot user).
+- This does **not** open a PR on a fork when you only have fork access; you need push rights to the **same** repo you cloned (or adjust the workflow yourself).
+- Commits use **`user.name` / `user.email`** from **`KIRO_REVIEW_GIT_NAME`** and **`KIRO_REVIEW_GIT_EMAIL`** in the environment, or defaults `code-review-bot` / `code-review-bot@users.noreply.github.com` (local config inside the clone only).
+
+**Note:** If Kiro modified other files in the working tree, only the review markdown file is **staged**; other changes stay unstaged. The PR body repeats the report text (truncated if it exceeds GitHub’s size limit); the full text is always in the committed file.
+
+### `Permission denied` / `403` on `git push`
+
+The message `Permission to owner/repo.git denied to <user>` means GitHub recognized your account but **refused the push**. Typical causes:
+
+| Cause | What to do |
+|--------|------------|
+| PAT is **read-only** | Fine-grained: set **Contents** and **Pull requests** to **Read and write** for that repo. Classic: enable **`repo`** (not only metadata). |
+| **Organization** + SSO | **Settings → Developer settings →** your token → **Configure SSO** / authorize the org. |
+| Wrong env token | **`GITHUB_TOKEN`** may be set by another app or CI to a limited token. Use **`--github-token`** with a personal PAT you created for this. |
+| No write access | You must be allowed to push to **that** repository (collaborator or owner). |
+
+If push fails, the tool still leaves a **local commit** on `code-review/...` inside the clone; the CLI error suggests a manual `git push` command you can run after fixing the token.
+
 ## How it works
 
 1. Optionally runs `git clone` into `--dir`, or into **`.review-repos/clone-…`** next to `package.json` (that folder is **gitignored**). Clones are **kept** unless you pass **`--delete-clone`** (default path only).
@@ -136,8 +173,9 @@ Generated **`reviews/*.md`** files are listed in **`.gitignore`** so they are no
 
 4. Sets `KIRO_LOG_NO_COLOR=1` unless you already exported it.
 5. Writes the transcript to **`reviews/…`** (or **`--output`**).
+6. With **`--github-pr`**, commits that report into the reviewed clone, pushes a branch, and calls the **GitHub REST API** to open a pull request (needs **`GITHUB_TOKEN`** or **`--github-token`**).
 
-Private repositories use whatever credentials your **git** setup provides (SSH agent, credential helper, etc.).
+Private repositories use whatever credentials your **git** setup provides (SSH agent, credential helper, etc.). **`--github-pr`** push uses the token over HTTPS (not your SSH agent).
 
 ## Docker
 
