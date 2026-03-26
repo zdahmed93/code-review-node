@@ -1,0 +1,165 @@
+name: Auto Review External Repos
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: "GitHub repo to review (owner/repo)"
+        required: true
+        type: string
+      pr_base:
+        description: "Optional PR base branch (default: repo default branch)"
+        required: false
+        type: string
+  repository_dispatch:
+    types:
+      - run-external-review
+  push:
+    branches:
+      - "**"
+    tags:
+      - "review-*"
+
+permissions:
+  contents: read
+
+jobs:
+  run-review:
+    # workflow_dispatch: always
+    # repository_dispatch: target repo passed in client_payload
+    # push tag: review-owner__repo
+    # push commit: include [review:owner/repo] in message
+    if: >-
+      github.actor != 'github-actions[bot]' &&
+      (
+        github.event_name == 'workflow_dispatch' ||
+        github.event_name == 'repository_dispatch' ||
+        startsWith(github.ref, 'refs/tags/review-') ||
+        contains(github.event.head_commit.message || '', '[review:')
+      )
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout orchestrator repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Resolve target repo and options
+        id: params
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TARGET_REPO: ${{ inputs.target_repo }}
+          INPUT_PR_BASE: ${{ inputs.pr_base }}
+          PAYLOAD_TARGET_REPO: ${{ github.event.client_payload.target_repo }}
+          PAYLOAD_PR_BASE: ${{ github.event.client_payload.pr_base }}
+          REF_NAME: ${{ github.ref_name }}
+          HEAD_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+
+          target_repo=""
+          pr_base="${INPUT_PR_BASE:-}"
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            target_repo="${INPUT_TARGET_REPO:-}"
+          elif [ "$EVENT_NAME" = "repository_dispatch" ]; then
+            target_repo="${PAYLOAD_TARGET_REPO:-}"
+            if [ -n "${PAYLOAD_PR_BASE:-}" ]; then
+              pr_base="${PAYLOAD_PR_BASE}"
+            fi
+          elif [[ "$REF_NAME" == review-* ]]; then
+            # Tag format: review-owner__repo (example: review-zdahmed93__java-kata-example)
+            payload="${REF_NAME#review-}"
+            if [[ "$payload" == *"__"* ]]; then
+              owner="${payload%%__*}"
+              repo="${payload#*__}"
+              target_repo="$owner/$repo"
+            fi
+          else
+            # Commit format: [review:owner/repo]
+            if [[ "$HEAD_MSG" =~ \[review:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)\] ]]; then
+              target_repo="${BASH_REMATCH[1]}"
+            fi
+          fi
+
+          if [ -z "$target_repo" ]; then
+            echo "No target repo resolved."
+            echo "Use one of:"
+            echo "  - workflow_dispatch input target_repo=owner/repo"
+            echo "  - tag: review-owner__repo"
+            echo "  - commit message: [review:owner/repo]"
+            exit 1
+          fi
+
+          echo "target_repo=$target_repo" >> "$GITHUB_OUTPUT"
+          echo "pr_base=$pr_base" >> "$GITHUB_OUTPUT"
+          echo "Resolved target_repo=$target_repo"
+
+      - name: Install Kiro CLI
+        run: |
+          set -euo pipefail
+          curl -fsSL https://cli.kiro.dev/install | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          kiro-cli --help-all >/dev/null
+
+      - name: Restore Kiro auth profile
+        shell: bash
+        env:
+          KIRO_PROFILE_TGZ_B64: ${{ secrets.KIRO_PROFILE_TGZ_B64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "$KIRO_PROFILE_TGZ_B64" ]; then
+            echo "Missing secret KIRO_PROFILE_TGZ_B64."
+            echo "Create it locally: tar -C \"$HOME\" -czf - .kiro | base64"
+            exit 1
+          fi
+          mkdir -p "$HOME"
+          printf '%s' "$KIRO_PROFILE_TGZ_B64" | base64 -d | tar -xzf - -C "$HOME"
+          test -d "$HOME/.kiro"
+
+      - name: Run review and open PR on target repo
+        shell: bash
+        env:
+          REVIEW_GITHUB_TOKEN: ${{ secrets.REVIEW_GITHUB_TOKEN }}
+          KIRO_REVIEW_GIT_NAME: code-review-bot
+          KIRO_REVIEW_GIT_EMAIL: code-review-bot@users.noreply.github.com
+          TARGET_REPO: ${{ steps.params.outputs.target_repo }}
+          PR_BASE: ${{ steps.params.outputs.pr_base }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$REVIEW_GITHUB_TOKEN" ]; then
+            echo "Missing secret REVIEW_GITHUB_TOKEN (PAT with Contents+PR write)."
+            exit 1
+          fi
+
+          cmd=(
+            node ./bin/kiro-repo-review.mjs
+            --github-pr
+            --github-token "$REVIEW_GITHUB_TOKEN"
+            --pr-title "chore: automated code review (${SHA:0:7})"
+            --pr-file "docs/code-reviews/auto-${SHA}.md"
+            "$TARGET_REPO"
+          )
+
+          if [ -n "$PR_BASE" ]; then
+            cmd+=(--pr-base "$PR_BASE")
+          fi
+
+          "${cmd[@]}"
+
+      - name: Upload local review artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-output-${{ github.run_id }}
+          path: reviews/*.md
+          if-no-files-found: ignore

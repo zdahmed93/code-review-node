@@ -177,6 +177,97 @@ If push fails, the tool still leaves a **local commit** on `code-review/...` ins
 
 Private repositories use whatever credentials your **git** setup provides (SSH agent, credential helper, etc.). **`--github-pr`** push uses the token over HTTPS (not your SSH agent).
 
+## Automation (GitHub Actions)
+
+Un workflow est fourni: `./.github/workflows/auto-review.yml`.
+
+Ce workflow permet de lancer le review sur **des repos externes** (pas seulement ce projet).
+
+### Triggers supportés
+
+1. **Manuel (`workflow_dispatch`)** avec input `target_repo=owner/repo`
+2. **Tag push** au format: `review-owner__repo`
+   - exemple: `review-zdahmed93__java-kata-example`
+3. **Commit message** contenant: `[review:owner/repo]`
+   - exemple: `feat: trigger review [review:zdahmed93/java-kata-example]`
+4. **Cross-repo event** via `repository_dispatch` (`event_type: run-external-review`)
+
+### Ce que fait le job
+
+1. installe Kiro CLI
+2. restaure `~/.kiro` depuis un secret
+3. exécute `kiro-repo-review owner/repo --github-pr`
+4. ouvre une PR dans le **repo ciblé** avec le rapport dans `docs/code-reviews/`
+
+Secrets à créer dans GitHub (repo → Settings → Secrets and variables → Actions):
+
+- `REVIEW_GITHUB_TOKEN`: PAT avec droits write (Contents + Pull requests) sur les repos à reviewer
+- `KIRO_PROFILE_TGZ_B64`: archive base64 de ton dossier local `~/.kiro`
+
+Commande pour générer `KIRO_PROFILE_TGZ_B64` sur macOS/Linux:
+
+```bash
+tar -C "$HOME" -czf - .kiro | base64
+```
+
+Exemples de déclenchement:
+
+```bash
+# 1) workflow_dispatch depuis UI GitHub
+# target_repo: zdahmed93/java-kata-example
+
+# 2) tag trigger
+git tag review-zdahmed93__java-kata-example
+git push origin review-zdahmed93__java-kata-example
+
+# 3) commit trigger
+git commit -m "chore: launch automated review [review:zdahmed93/java-kata-example]"
+git push
+```
+
+### Déclencher depuis le repo cible (recommandé)
+
+Dans chaque repo que tu veux reviewer, ajoute un workflow qui appelle l'orchestrateur via `repository_dispatch`:
+
+```yaml
+name: Trigger External Review
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch review request to orchestrator
+        env:
+          ORCH_OWNER: your-user-or-org
+          ORCH_REPO: code-review-node
+          ORCH_PAT: ${{ secrets.ORCH_PAT }}
+          TARGET_REPO: ${{ github.repository }}
+        run: |
+          test -n "$ORCH_PAT"
+          curl -sS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $ORCH_PAT" \
+            https://api.github.com/repos/$ORCH_OWNER/$ORCH_REPO/dispatches \
+            -d @- <<JSON
+          {
+            "event_type": "run-external-review",
+            "client_payload": {
+              "target_repo": "$TARGET_REPO",
+              "pr_base": "main"
+            }
+          }
+          JSON
+```
+
+Dans le repo cible, crée le secret `ORCH_PAT` (PAT qui a le droit de déclencher les workflows / dispatch events sur le repo orchestrateur).
+
+> Note: le workflow tourne sur `ubuntu-latest` (runner GitHub). Si ton auth Kiro exige un autre mode d'accès, utilise un self-hosted runner.
+
 ## Docker
 
 Build (needs network to download the Kiro CLI installer):
