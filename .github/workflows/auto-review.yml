@@ -124,6 +124,18 @@ jobs:
           printf '%s' "$KIRO_PROFILE_TGZ_B64" | base64 -d | tar -xzf - -C "$HOME"
           test -d "$HOME/.kiro"
 
+      - name: Validate Kiro authentication
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! kiro-cli whoami >/dev/null 2>&1; then
+            echo "Kiro auth is not valid on this runner."
+            echo "GitHub-hosted runners cannot complete browser login automatically."
+            echo "Refresh secret KIRO_PROFILE_TGZ_B64 from a machine already logged in,"
+            echo "or run this workflow on a self-hosted runner with persistent ~/.kiro."
+            exit 1
+          fi
+
       - name: Run review and open PR on target repo
         shell: bash
         env:

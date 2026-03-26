@@ -204,6 +204,16 @@ Secrets à créer dans GitHub (repo → Settings → Secrets and variables → A
 - `REVIEW_GITHUB_TOKEN`: PAT avec droits write (Contents + Pull requests) sur les repos à reviewer
 - `KIRO_PROFILE_TGZ_B64`: archive base64 de ton dossier local `~/.kiro`
 
+### Important: auth Kiro sur runner GitHub
+
+Le runner `ubuntu-latest` ne peut pas faire un login navigateur interactif pendant le job.  
+Le workflow vérifie maintenant `kiro-cli whoami` avant le review.
+
+Si ça échoue:
+
+- régénère `KIRO_PROFILE_TGZ_B64` depuis une machine où `kiro-cli whoami` fonctionne déjà
+- ou utilise un self-hosted runner avec `~/.kiro` persistant (login fait une fois)
+
 Commande pour générer `KIRO_PROFILE_TGZ_B64` sur macOS/Linux:
 
 ```bash

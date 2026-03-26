@@ -564,6 +564,7 @@ async function main() {
   console.error(`Wrote review report: ${reportPath}`);
 
   let exitCode = kiroSignal ? 1 : (kiroExitCode ?? 1);
+  let prCreated = false;
 
   if (values["github-pr"]) {
     const token = values["github-token"]?.trim() || process.env.GITHUB_TOKEN?.trim();
@@ -585,11 +586,21 @@ async function main() {
           prTitle: values["pr-title"],
           prFileInRepo,
         });
+        prCreated = true;
       } catch (e) {
         console.error(e instanceof Error ? e.message : e);
         exitCode = 1;
       }
     }
+  }
+
+  // In CI/headless environments, Kiro can exit non-zero after producing output
+  // (e.g. browser auth opening failure). If PR creation succeeded, don't fail run.
+  if (values["github-pr"] && prCreated && exitCode !== 0) {
+    console.error(
+      `Warning: Kiro exited with code ${exitCode}, but PR was created successfully; returning success.`,
+    );
+    exitCode = 0;
   }
 
   if (cleanupDir) {
