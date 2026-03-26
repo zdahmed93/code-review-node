@@ -194,31 +194,26 @@ Ce workflow permet de lancer le review sur **des repos externes** (pas seulement
 
 ### Ce que fait le job
 
-1. installe Kiro CLI
-2. restaure `~/.kiro` depuis un secret
+1. utilise un runner **self-hosted** (ta machine locale / ton serveur)
+2. vérifie `kiro-cli` + session (`kiro-cli whoami`) sur ce runner
 3. exécute `kiro-repo-review owner/repo --github-pr`
 4. ouvre une PR dans le **repo ciblé** avec le rapport dans `docs/code-reviews/`
 
 Secrets à créer dans GitHub (repo → Settings → Secrets and variables → Actions):
 
 - `REVIEW_GITHUB_TOKEN`: PAT avec droits write (Contents + Pull requests) sur les repos à reviewer
-- `KIRO_PROFILE_TGZ_B64`: archive base64 de ton dossier local `~/.kiro`
 
-### Important: auth Kiro sur runner GitHub
+### Important: auth Kiro sur self-hosted runner
 
-Le runner `ubuntu-latest` ne peut pas faire un login navigateur interactif pendant le job.  
-Le workflow vérifie maintenant `kiro-cli whoami` avant le review.
-
-Si ça échoue:
-
-- régénère `KIRO_PROFILE_TGZ_B64` depuis une machine où `kiro-cli whoami` fonctionne déjà
-- ou utilise un self-hosted runner avec `~/.kiro` persistant (login fait une fois)
-
-Commande pour générer `KIRO_PROFILE_TGZ_B64` sur macOS/Linux:
+Le workflow est configuré pour tourner sur `runs-on: [self-hosted]`.
+Tu dois installer Kiro CLI et faire le login **directement sur la machine runner**:
 
 ```bash
-tar -C "$HOME" -czf - .kiro | base64
+kiro-cli login
+kiro-cli whoami
 ```
+
+Si `whoami` échoue dans le job, reconnecte Kiro sur la machine runner puis relance.
 
 Exemples de déclenchement:
 
@@ -276,7 +271,7 @@ jobs:
 
 Dans le repo cible, crée le secret `ORCH_PAT` (PAT qui a le droit de déclencher les workflows / dispatch events sur le repo orchestrateur).
 
-> Note: le workflow tourne sur `ubuntu-latest` (runner GitHub). Si ton auth Kiro exige un autre mode d'accès, utilise un self-hosted runner.
+> Note: le workflow est actuellement **pinné** sur `runs-on: [self-hosted, macOS]`. Si tes labels runner sont différents, adapte cette ligne.
 
 ## Docker
 
