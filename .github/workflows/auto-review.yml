@@ -37,7 +37,9 @@ jobs:
         startsWith(github.ref, 'refs/tags/review-') ||
         contains(github.event.head_commit.message || '', '[review:')
       )
-    runs-on: ubuntu-latest
+    # Run on your local machine / server registered as a self-hosted runner.
+    # Pinned to your local macOS runner labels.
+    runs-on: [self-hosted, macOS]
 
     steps:
       - name: Checkout orchestrator repo
@@ -102,37 +104,18 @@ jobs:
           echo "pr_base=$pr_base" >> "$GITHUB_OUTPUT"
           echo "Resolved target_repo=$target_repo"
 
-      - name: Install Kiro CLI
-        run: |
-          set -euo pipefail
-          curl -fsSL https://cli.kiro.dev/install | bash
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          kiro-cli --help-all >/dev/null
-
-      - name: Restore Kiro auth profile
-        shell: bash
-        env:
-          KIRO_PROFILE_TGZ_B64: ${{ secrets.KIRO_PROFILE_TGZ_B64 }}
-        run: |
-          set -euo pipefail
-          if [ -z "$KIRO_PROFILE_TGZ_B64" ]; then
-            echo "Missing secret KIRO_PROFILE_TGZ_B64."
-            echo "Create it locally: tar -C \"$HOME\" -czf - .kiro | base64"
-            exit 1
-          fi
-          mkdir -p "$HOME"
-          printf '%s' "$KIRO_PROFILE_TGZ_B64" | base64 -d | tar -xzf - -C "$HOME"
-          test -d "$HOME/.kiro"
-
       - name: Validate Kiro authentication
         shell: bash
         run: |
           set -euo pipefail
+          if ! command -v kiro-cli >/dev/null 2>&1; then
+            echo "kiro-cli is not installed on this self-hosted runner."
+            echo "Install it once on the runner machine: https://kiro.dev/docs/cli/installation/"
+            exit 1
+          fi
           if ! kiro-cli whoami >/dev/null 2>&1; then
             echo "Kiro auth is not valid on this runner."
-            echo "GitHub-hosted runners cannot complete browser login automatically."
-            echo "Refresh secret KIRO_PROFILE_TGZ_B64 from a machine already logged in,"
-            echo "or run this workflow on a self-hosted runner with persistent ~/.kiro."
+            echo "Run 'kiro-cli login' on the self-hosted runner machine, then retry."
             exit 1
           fi
 
