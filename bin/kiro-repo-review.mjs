@@ -1,15 +1,17 @@
 #!/usr/bin/env node
 /**
- * Clone a Git repository (or use a local path) and ask Kiro CLI to review it.
- * Requires: git on PATH, kiro-cli installed and logged in (https://kiro.dev/docs/cli/).
+ * Clone a Git repository (or use a local path) and run an AI review via Bedrock.
+ * Requires: git on PATH and AWS credentials with bedrock:InvokeModel permissions.
  */
 
+import "dotenv/config";
 import { parseArgs } from "node:util";
 import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, writeFile, rm, access } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { ChatBedrockConverse } from "@langchain/aws";
 
 const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -21,6 +23,14 @@ const REVIEWS_DIR = join(PACKAGE_ROOT, "reviews");
 
 /** Default review instructions (edit this file; committed with the repo). */
 const DEFAULT_PROMPT_FILE = join(PACKAGE_ROOT, "prompts", "default-review.md");
+const DEFAULT_BEDROCK_MODEL = "anthropic.claude-3-5-sonnet-20240620-v1:0";
+const DEFAULT_AWS_REGION = process.env.AWS_REGION || "eu-west-1";
+
+const TEXT_FILE_EXTENSIONS = new Set([
+  ".md", ".txt", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".json", ".yml", ".yaml",
+  ".xml", ".html", ".css", ".scss", ".sh", ".py", ".java", ".go", ".rs", ".rb", ".php",
+  ".cs", ".sql", ".toml", ".ini", ".env", ".dockerfile", ".gradle", ".properties",
+]);
 
 /** Used only if `prompts/default-review.md` is missing (e.g. broken install). */
 const FALLBACK_PROMPT = `You are reviewing a Node.js project in the current working directory (repository root).
@@ -54,11 +64,10 @@ Options:
   --depth <n>          Shallow clone depth (default: 1)
   --dir <path>         Clone into this directory (default: .review-repos/ under this package)
   --delete-clone       After review, remove the clone (only when using default .review-repos/ path)
-  --kiro <path>        kiro-cli binary (default: env KIRO_CLI or "kiro-cli")
-  --agent <name>       Pass --agent to Kiro
-  --trust-all-tools    Pass --trust-all-tools (default: on)
-  --no-trust-all-tools Disable --trust-all-tools
-  --json               Pass --format json (only if your kiro-cli supports it)
+  --bedrock-model <id> Bedrock model id (default: ${DEFAULT_BEDROCK_MODEL})
+  --aws-region <name>  AWS region for Bedrock (default: ${DEFAULT_AWS_REGION})
+  --max-files <n>      Max tracked files to include in context (default: 120)
+  --max-context-chars  Max total chars sent as code context (default: 180000)
   --prompt <text>      Review instructions (overrides default markdown file)
   --prompt-file <path> Read review instructions from a file (overrides default markdown file)
   --output <path>      Write report markdown here (default: reviews/<slug>-<timestamp>.md in this package)
@@ -164,7 +173,7 @@ function buildReportMarkdown({
 | Generated (UTC) | ${when} |
 | Reviewed path | \`${escapeMdTableCell(reviewedPath)}\` |
 | Source | ${escapeMdTableCell(sourceLabel)} |
-| Kiro exit | ${escapeMdTableCell(exitBits)} |
+| Model status | ${escapeMdTableCell(exitBits)} |
 
 ## Standard output
 
@@ -360,7 +369,7 @@ async function createGithubPullRequestForReview({
     prTitle?.trim() ||
     `chore: automated code review report (${new Date().toISOString().slice(0, 10)})`;
   const maxBody = 60000;
-  const intro = `Automated code review (Kiro CLI).\n\n**Report file:** \`${fileRel}\`\n\n---\n\n`;
+  const intro = `Automated code review (LangChain + Bedrock).\n\n**Report file:** \`${fileRel}\`\n\n---\n\n`;
   let body = intro + reportMd;
   if (body.length > maxBody) {
     body =
@@ -411,6 +420,61 @@ async function resolveReviewPrompt(values) {
   return FALLBACK_PROMPT;
 }
 
+function shouldIncludeTextFile(file) {
+  const lowered = file.toLowerCase();
+  const ext = lowered.includes(".") ? lowered.slice(lowered.lastIndexOf(".")) : "";
+  if (TEXT_FILE_EXTENSIONS.has(ext)) return true;
+  if (lowered.endsWith("dockerfile")) return true;
+  return false;
+}
+
+async function collectRepoContext(repoDir, maxFiles, maxContextChars) {
+  const listed = await runCapture("git", ["-C", repoDir, "ls-files"], { env: process.env });
+  let files = [];
+  if (listed.code === 0) {
+    files = listed.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  }
+  if (files.length === 0) {
+    const fsList = await runCapture("ls", ["-la"], { cwd: repoDir, env: process.env });
+    return `No git index detected. Directory listing:\n${fsList.stdout || "(empty)"}`;
+  }
+
+  const picked = files.filter(shouldIncludeTextFile).slice(0, Math.max(1, maxFiles));
+  let remaining = Math.max(2000, maxContextChars);
+  let out = `Repository files sampled: ${picked.length}/${files.length}\n\n`;
+
+  for (const rel of picked) {
+    if (remaining <= 0) break;
+    const abs = join(repoDir, rel);
+    let content = "";
+    try {
+      content = await readFile(abs, "utf8");
+    } catch {
+      continue;
+    }
+    const fileBudget = Math.min(12000, remaining);
+    const clipped = content.length > fileBudget ? `${content.slice(0, fileBudget)}\n\n...[truncated]` : content;
+    out += `--- FILE: ${rel} ---\n${clipped}\n\n`;
+    remaining -= clipped.length + rel.length + 20;
+  }
+  return out;
+}
+
+function normalizeModelTextContent(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === "string") return part;
+        if (part && typeof part === "object" && "text" in part) return part.text ?? "";
+        return "";
+      })
+      .join("\n")
+      .trim();
+  }
+  return String(content ?? "");
+}
+
 async function main() {
   const { values, positionals } = parseArgs({
     allowPositionals: true,
@@ -420,11 +484,10 @@ async function main() {
       depth: { type: "string", default: "1" },
       dir: { type: "string" },
       "delete-clone": { type: "boolean", default: false },
-      kiro: { type: "string" },
-      agent: { type: "string" },
-      "trust-all-tools": { type: "boolean", default: true },
-      "no-trust-all-tools": { type: "boolean", default: false },
-      json: { type: "boolean", default: false },
+      "bedrock-model": { type: "string" },
+      "aws-region": { type: "string" },
+      "max-files": { type: "string", default: "120" },
+      "max-context-chars": { type: "string", default: "180000" },
       prompt: { type: "string" },
       "prompt-file": { type: "string" },
       output: { type: "string" },
@@ -443,11 +506,21 @@ async function main() {
     process.exit(0);
   }
 
-  const trustAllTools = values["no-trust-all-tools"] ? false : values["trust-all-tools"];
-  const kiroBin = values.kiro?.trim() || process.env.KIRO_CLI?.trim() || "kiro-cli";
+  const bedrockModel = values["bedrock-model"]?.trim() || process.env.BEDROCK_MODEL_ID || DEFAULT_BEDROCK_MODEL;
+  const awsRegion = values["aws-region"]?.trim() || process.env.AWS_REGION || DEFAULT_AWS_REGION;
+  const maxFiles = parseInt(values["max-files"], 10);
+  const maxContextChars = parseInt(values["max-context-chars"], 10);
   const timeoutSec = values.timeout !== undefined ? parseInt(values.timeout, 10) : 0;
   if (values.timeout !== undefined && (!Number.isFinite(timeoutSec) || timeoutSec < 0)) {
     console.error("Invalid --timeout: use a non-negative integer (seconds).");
+    process.exit(1);
+  }
+  if (!Number.isFinite(maxFiles) || maxFiles < 1) {
+    console.error("Invalid --max-files: use a positive integer.");
+    process.exit(1);
+  }
+  if (!Number.isFinite(maxContextChars) || maxContextChars < 5000) {
+    console.error("Invalid --max-context-chars: use an integer >= 5000.");
     process.exit(1);
   }
 
@@ -496,57 +569,50 @@ async function main() {
 
   const prompt = await resolveReviewPrompt(values);
 
-  const kiroArgs = ["chat", "--no-interactive"];
-  if (values.json) kiroArgs.push("--format", "json");
-  if (trustAllTools) kiroArgs.push("--trust-all-tools");
-  if (values.agent?.trim()) kiroArgs.push("--agent", values.agent.trim());
-  kiroArgs.push(prompt);
-
-  const env = {
-    ...process.env,
-    KIRO_LOG_NO_COLOR: process.env.KIRO_LOG_NO_COLOR || "1",
-    // Hint for CLIs that follow https://no-color.org/ (Kiro may still emit some CSI codes).
-    NO_COLOR: process.env.NO_COLOR || "1",
-  };
-
   const { sourceLabel, slug } = values.local
     ? reportIdentity(null, null, repoDir)
     : reportIdentity(repoArg, cloneUrl, null);
 
-  console.error(`Running Kiro in ${repoDir} …`);
-  const stdoutChunks = [];
-  const stderrChunks = [];
+  console.error(`Collecting repository context in ${repoDir} …`);
+  const repoContext = await collectRepoContext(repoDir, maxFiles, maxContextChars);
+  console.error(`Running Bedrock model ${bedrockModel} (${awsRegion}) …`);
 
-  const child = spawn(kiroBin, kiroArgs, {
-    cwd: repoDir,
-    env,
-    stdio: ["ignore", "pipe", "pipe"],
+  let modelText = "";
+  let modelErr = "";
+  let modelExitCode = 0;
+  let timedOut = false;
+  const llm = new ChatBedrockConverse({
+    model: bedrockModel,
+    region: awsRegion,
+    temperature: 0,
+    maxTokens: 4096,
   });
-  child.stdout?.setEncoding("utf8");
-  child.stderr?.setEncoding("utf8");
-  child.stdout?.on("data", (chunk) => {
-    stdoutChunks.push(chunk);
-    process.stdout.write(chunk);
-  });
-  child.stderr?.on("data", (chunk) => {
-    stderrChunks.push(chunk);
-    process.stderr.write(chunk);
-  });
-
-  let timeoutId;
-  if (timeoutSec > 0) {
-    timeoutId = setTimeout(() => {
-      child.kill("SIGTERM");
-    }, timeoutSec * 1000);
+  try {
+    const task = llm.invoke([
+      ["system", "You are a senior software reviewer. Output markdown only."],
+      [
+        "human",
+        `Review this repository.\n\nReview instructions:\n${prompt}\n\nRepository snapshot:\n${repoContext}`,
+      ],
+    ]);
+    const response = timeoutSec > 0
+      ? await Promise.race([
+          task,
+          new Promise((_, reject) =>
+            setTimeout(() => {
+              timedOut = true;
+              reject(new Error(`Timed out after ${timeoutSec}s`));
+            }, timeoutSec * 1000),
+          ),
+        ])
+      : await task;
+    modelText = normalizeModelTextContent(response.content);
+    process.stdout.write(`${modelText}\n`);
+  } catch (err) {
+    modelExitCode = 1;
+    modelErr = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`${modelErr}\n`);
   }
-
-  const { code: kiroExitCode, signal: kiroSignal } = await new Promise((resolve, reject) => {
-    child.on("error", reject);
-    child.on("close", (code, signal) => {
-      resolve({ code, signal });
-    });
-  });
-  if (timeoutId) clearTimeout(timeoutId);
 
   const reportPath = values.output?.trim()
     ? values.output.trim()
@@ -555,15 +621,15 @@ async function main() {
   const reportMd = buildReportMarkdown({
     reviewedPath: repoDir,
     sourceLabel,
-    exitCode: kiroExitCode,
-    signal: kiroSignal,
-    stdout: stripAnsi(stdoutChunks.join("")),
-    stderr: stripAnsi(stderrChunks.join("")),
+    exitCode: modelExitCode,
+    signal: timedOut ? "SIGTERM" : null,
+    stdout: stripAnsi(modelText),
+    stderr: stripAnsi(modelErr),
   });
   await writeFile(reportPath, reportMd, "utf8");
   console.error(`Wrote review report: ${reportPath}`);
 
-  let exitCode = kiroSignal ? 1 : (kiroExitCode ?? 1);
+  let exitCode = timedOut ? 1 : modelExitCode;
   let prCreated = false;
 
   if (values["github-pr"]) {
@@ -594,11 +660,10 @@ async function main() {
     }
   }
 
-  // In CI/headless environments, Kiro can exit non-zero after producing output
-  // (e.g. browser auth opening failure). If PR creation succeeded, don't fail run.
+  // If PR creation succeeded, keep run green even if model call failed in this pass.
   if (values["github-pr"] && prCreated && exitCode !== 0) {
     console.error(
-      `Warning: Kiro exited with code ${exitCode}, but PR was created successfully; returning success.`,
+      `Warning: model invocation failed with code ${exitCode}, but PR was created successfully; returning success.`,
     );
     exitCode = 0;
   }

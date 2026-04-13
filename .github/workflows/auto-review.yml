@@ -52,6 +52,10 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Install dependencies
+        shell: bash
+        run: npm ci
+
       - name: Resolve target repo and options
         id: params
         shell: bash
@@ -104,25 +108,11 @@ jobs:
           echo "pr_base=$pr_base" >> "$GITHUB_OUTPUT"
           echo "Resolved target_repo=$target_repo"
 
-      - name: Validate Kiro authentication
-        shell: bash
-        run: |
-          set -euo pipefail
-          if ! command -v kiro-cli >/dev/null 2>&1; then
-            echo "kiro-cli is not installed on this self-hosted runner."
-            echo "Install it once on the runner machine: https://kiro.dev/docs/cli/installation/"
-            exit 1
-          fi
-          if ! kiro-cli whoami >/dev/null 2>&1; then
-            echo "Kiro auth is not valid on this runner."
-            echo "Run 'kiro-cli login' on the self-hosted runner machine, then retry."
-            exit 1
-          fi
-
       - name: Run review and open PR on target repo
         shell: bash
         env:
           REVIEW_GITHUB_TOKEN: ${{ secrets.REVIEW_GITHUB_TOKEN }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
           KIRO_REVIEW_GIT_NAME: code-review-bot
           KIRO_REVIEW_GIT_EMAIL: code-review-bot@users.noreply.github.com
           TARGET_REPO: ${{ steps.params.outputs.target_repo }}
@@ -133,6 +123,10 @@ jobs:
 
           if [ -z "$REVIEW_GITHUB_TOKEN" ]; then
             echo "Missing secret REVIEW_GITHUB_TOKEN (PAT with Contents+PR write)."
+            exit 1
+          fi
+          if [ -z "${AWS_REGION:-}" ]; then
+            echo "Missing secret AWS_REGION (example: eu-west-1)."
             exit 1
           fi
 

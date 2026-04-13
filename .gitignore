@@ -1,2 +1,5 @@
 .review-repos/
 reviews/*.md
+node_modules/
+.env
+.env.local

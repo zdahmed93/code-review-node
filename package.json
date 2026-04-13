@@ -6,6 +6,10 @@
   "scripts": {
     "review": "node ./bin/kiro-repo-review.mjs"
   },
+  "dependencies": {
+    "@langchain/aws": "^0.1.15",
+    "dotenv": "^17.2.3"
+  },
   "bin": {
     "kiro-repo-review": "./bin/kiro-repo-review.mjs"
   },
