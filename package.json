@@ -1,13 +1,14 @@
 {
   "name": "code-review-node",
   "version": "1.0.0",
-  "description": "Clone a GitHub repo and run a Kiro CLI code review in the working tree",
+  "description": "Clone a repo and run an AI code review via LangChain (Ollama locally by default)",
   "type": "module",
   "scripts": {
     "review": "node ./bin/kiro-repo-review.mjs"
   },
   "dependencies": {
     "@langchain/aws": "^0.1.15",
+    "@langchain/ollama": "^0.2.4",
     "dotenv": "^17.2.3"
   },
   "bin": {

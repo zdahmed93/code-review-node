@@ -16,14 +16,15 @@ Ce guide permet a un autre developpeur de reproduire rapidement tout le setup:
 - Node.js 18+ (22 recommande)
 - git
 - compte GitHub avec acces aux repos concernes
-- Kiro CLI installe + session valide
+- [Ollama](https://ollama.com/) installe + au moins un modele (ex. `ollama pull llama3.2`)
 
 Verifier localement:
 
 ```bash
 node -v
 git --version
-kiro-cli whoami
+ollama list
+curl -fsS http://127.0.0.1:11434/api/tags >/dev/null && echo "Ollama OK"
 ```
 
 ---
@@ -203,14 +204,16 @@ Verification:
 - labels mismatch (`runs-on` vs labels runner)
 - runner attache au mauvais repo
 
-### B) "Kiro auth is not valid on this runner"
+### B) Ollama injoignable sur le runner
 
-Sur la machine runner:
+Sur la machine runner: lancer l’app Ollama (ou `ollama serve`), puis:
 
 ```bash
-kiro-cli login
-kiro-cli whoami
+ollama list
+curl -fsS http://127.0.0.1:11434/api/tags
 ```
+
+Le workflow verifie que l’API Ollama repond sur `127.0.0.1:11434` (aligne avec `OLLAMA_BASE_URL` par defaut).
 
 ### C) 403 "Resource not accessible by personal access token" (dispatch)
 
@@ -226,7 +229,7 @@ Le `REVIEW_GITHUB_TOKEN` n'a pas les droits write sur le repo analyse.
 ## 8) Checklist finale (Go/No-Go)
 
 - [ ] Runner self-hosted online avec labels `self-hosted,macOS`
-- [ ] `kiro-cli whoami` OK sur machine runner
+- [ ] Ollama OK sur la machine runner (`curl` vers `/api/tags` ou `ollama list`)
 - [ ] Secret `REVIEW_GITHUB_TOKEN` configure dans `code-review-node`
 - [ ] Secret `ORCH_PAT` configure dans le repo externe
 - [ ] Test `workflow_dispatch` OK

@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
- * Clone a Git repository (or use a local path) and run an AI review via Bedrock.
- * Requires: git on PATH and AWS credentials with bedrock:InvokeModel permissions.
+ * Clone a Git repository (or use a local path) and run an AI review via LangChain.
+ * Backends: Bedrock (AWS), Ollama (local), or stub (no external LLM — pipeline test only).
  */
 
-import "dotenv/config";
+import dotenv from "dotenv";
 import { parseArgs } from "node:util";
 import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, writeFile, rm, access } from "node:fs/promises";
@@ -12,8 +12,12 @@ import { constants as fsConstants } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { ChatBedrockConverse } from "@langchain/aws";
+import { ChatOllama } from "@langchain/ollama";
 
 const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+
+// Load `.env` from the package root (works even when cwd is elsewhere).
+dotenv.config({ path: join(PACKAGE_ROOT, ".env") });
 
 /** Parent folder for default clones: `<this package>/.review-repos/` (gitignored). */
 const DEFAULT_CLONES_PARENT = join(PACKAGE_ROOT, ".review-repos");
@@ -25,6 +29,9 @@ const REVIEWS_DIR = join(PACKAGE_ROOT, "reviews");
 const DEFAULT_PROMPT_FILE = join(PACKAGE_ROOT, "prompts", "default-review.md");
 const DEFAULT_BEDROCK_MODEL = "anthropic.claude-3-5-sonnet-20240620-v1:0";
 const DEFAULT_AWS_REGION = process.env.AWS_REGION || "eu-west-1";
+const DEFAULT_LLM_PROVIDER = (process.env.LLM_PROVIDER?.trim() || "ollama").toLowerCase();
+const DEFAULT_OLLAMA_MODEL = process.env.OLLAMA_MODEL || "llama3.2";
+const DEFAULT_OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434";
 
 const TEXT_FILE_EXTENSIONS = new Set([
   ".md", ".txt", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".json", ".yml", ".yaml",
@@ -64,8 +71,11 @@ Options:
   --depth <n>          Shallow clone depth (default: 1)
   --dir <path>         Clone into this directory (default: .review-repos/ under this package)
   --delete-clone       After review, remove the clone (only when using default .review-repos/ path)
+  --llm-provider <p>   LLM backend: ollama | bedrock | stub (default: env LLM_PROVIDER or ollama)
   --bedrock-model <id> Bedrock model id (default: ${DEFAULT_BEDROCK_MODEL})
   --aws-region <name>  AWS region for Bedrock (default: ${DEFAULT_AWS_REGION})
+  --ollama-model <id>  Ollama model name when --llm-provider ollama (default: ${DEFAULT_OLLAMA_MODEL})
+  --ollama-base-url <u> Ollama API base URL (default: ${DEFAULT_OLLAMA_BASE_URL})
   --max-files <n>      Max tracked files to include in context (default: 120)
   --max-context-chars  Max total chars sent as code context (default: 180000)
   --prompt <text>      Review instructions (overrides default markdown file)
@@ -76,7 +86,7 @@ Options:
   --pr-base <branch>   PR target branch (default: GitHub default branch for the repo)
   --pr-title <text>    PR title (default: automated code review title)
   --pr-file <path>     Path for the report inside the repo (default: docs/code-reviews/<slug>-<ts>.md)
-  --timeout <sec>      Send SIGTERM to Kiro after N seconds (0 = no limit)
+  --timeout <sec>      Abort LLM call after N seconds (0 = no limit)
   -h, --help           Show this help
 `);
 }
@@ -158,6 +168,7 @@ function fencedTextBlock(s) {
 function buildReportMarkdown({
   reviewedPath,
   sourceLabel,
+  llmBackend,
   exitCode,
   signal,
   stdout,
@@ -166,6 +177,9 @@ function buildReportMarkdown({
   const when = new Date().toISOString();
   const exitBits =
     signal != null ? `signal ${signal}` : exitCode != null ? `code ${exitCode}` : "unknown";
+  const backendRow = llmBackend
+    ? `| LLM backend | ${escapeMdTableCell(llmBackend)} |\n`
+    : "";
   let body = `# Code review report
 
 | Field | Value |
@@ -173,7 +187,7 @@ function buildReportMarkdown({
 | Generated (UTC) | ${when} |
 | Reviewed path | \`${escapeMdTableCell(reviewedPath)}\` |
 | Source | ${escapeMdTableCell(sourceLabel)} |
-| Model status | ${escapeMdTableCell(exitBits)} |
+${backendRow}| Model status | ${escapeMdTableCell(exitBits)} |
 
 ## Standard output
 
@@ -318,6 +332,7 @@ async function createGithubPullRequestForReview({
   prBase,
   prTitle,
   prFileInRepo,
+  reviewEngineSummary = "LangChain",
 }) {
   const gitDir = await runCapture("git", ["rev-parse", "--git-dir"], { cwd: repoDir });
   if (gitDir.code !== 0) {
@@ -369,7 +384,7 @@ async function createGithubPullRequestForReview({
     prTitle?.trim() ||
     `chore: automated code review report (${new Date().toISOString().slice(0, 10)})`;
   const maxBody = 60000;
-  const intro = `Automated code review (LangChain + Bedrock).\n\n**Report file:** \`${fileRel}\`\n\n---\n\n`;
+  const intro = `Automated code review (${reviewEngineSummary}).\n\n**Report file:** \`${fileRel}\`\n\n---\n\n`;
   let body = intro + reportMd;
   if (body.length > maxBody) {
     body =
@@ -475,6 +490,43 @@ function normalizeModelTextContent(content) {
   return String(content ?? "");
 }
 
+/**
+ * @param {"bedrock" | "ollama" | "stub"} provider
+ */
+async function invokeReviewModel(provider, messages, opts) {
+  if (provider === "stub") {
+    const humanContent = messages.find((m) => m[0] === "human")?.[1] ?? "";
+    const text = [
+      "# Stub review (no cloud LLM)",
+      "",
+      "The LangChain pipeline and repository snapshot collection ran successfully.",
+      "No AWS Bedrock or Ollama API was called.",
+      "",
+      `**Human message size (chars):** ${humanContent.length}`,
+      "",
+      "For a real review locally without AWS: install [Ollama](https://ollama.com/) and set `LLM_PROVIDER=ollama`.",
+    ].join("\n");
+    return { content: text };
+  }
+
+  if (provider === "ollama") {
+    const llm = new ChatOllama({
+      model: opts.ollamaModel,
+      baseUrl: opts.ollamaBaseUrl,
+      temperature: 0,
+    });
+    return llm.invoke(messages);
+  }
+
+  const llm = new ChatBedrockConverse({
+    model: opts.bedrockModel,
+    region: opts.awsRegion,
+    temperature: 0,
+    maxTokens: 4096,
+  });
+  return llm.invoke(messages);
+}
+
 async function main() {
   const { values, positionals } = parseArgs({
     allowPositionals: true,
@@ -484,8 +536,11 @@ async function main() {
       depth: { type: "string", default: "1" },
       dir: { type: "string" },
       "delete-clone": { type: "boolean", default: false },
+      "llm-provider": { type: "string" },
       "bedrock-model": { type: "string" },
       "aws-region": { type: "string" },
+      "ollama-model": { type: "string" },
+      "ollama-base-url": { type: "string" },
       "max-files": { type: "string", default: "120" },
       "max-context-chars": { type: "string", default: "180000" },
       prompt: { type: "string" },
@@ -506,8 +561,18 @@ async function main() {
     process.exit(0);
   }
 
+  const rawProvider = (values["llm-provider"]?.trim() || process.env.LLM_PROVIDER || DEFAULT_LLM_PROVIDER).toLowerCase();
+  const allowedProviders = new Set(["bedrock", "ollama", "stub"]);
+  if (!allowedProviders.has(rawProvider)) {
+    console.error(`Invalid --llm-provider / LLM_PROVIDER "${rawProvider}": use bedrock, ollama, or stub.`);
+    process.exit(1);
+  }
+  const llmProvider = rawProvider;
+
   const bedrockModel = values["bedrock-model"]?.trim() || process.env.BEDROCK_MODEL_ID || DEFAULT_BEDROCK_MODEL;
   const awsRegion = values["aws-region"]?.trim() || process.env.AWS_REGION || DEFAULT_AWS_REGION;
+  const ollamaModel = values["ollama-model"]?.trim() || process.env.OLLAMA_MODEL || DEFAULT_OLLAMA_MODEL;
+  const ollamaBaseUrl = values["ollama-base-url"]?.trim() || process.env.OLLAMA_BASE_URL || DEFAULT_OLLAMA_BASE_URL;
   const maxFiles = parseInt(values["max-files"], 10);
   const maxContextChars = parseInt(values["max-context-chars"], 10);
   const timeoutSec = values.timeout !== undefined ? parseInt(values.timeout, 10) : 0;
@@ -575,37 +640,45 @@ async function main() {
 
   console.error(`Collecting repository context in ${repoDir} …`);
   const repoContext = await collectRepoContext(repoDir, maxFiles, maxContextChars);
-  console.error(`Running Bedrock model ${bedrockModel} (${awsRegion}) …`);
+  const llmBackendLabel =
+    llmProvider === "stub"
+      ? "stub (no LLM API)"
+      : llmProvider === "ollama"
+        ? `ollama:${ollamaModel} @ ${ollamaBaseUrl}`
+        : `bedrock:${bedrockModel} (${awsRegion})`;
+  console.error(`Running LLM (${llmBackendLabel}) …`);
 
   let modelText = "";
   let modelErr = "";
   let modelExitCode = 0;
   let timedOut = false;
-  const llm = new ChatBedrockConverse({
-    model: bedrockModel,
-    region: awsRegion,
-    temperature: 0,
-    maxTokens: 4096,
-  });
+  const messages = [
+    ["system", "You are a senior software reviewer. Output markdown only."],
+    [
+      "human",
+      `Review this repository.\n\nReview instructions:\n${prompt}\n\nRepository snapshot:\n${repoContext}`,
+    ],
+  ];
   try {
-    const task = llm.invoke([
-      ["system", "You are a senior software reviewer. Output markdown only."],
-      [
-        "human",
-        `Review this repository.\n\nReview instructions:\n${prompt}\n\nRepository snapshot:\n${repoContext}`,
-      ],
-    ]);
-    const response = timeoutSec > 0
-      ? await Promise.race([
-          task,
-          new Promise((_, reject) =>
-            setTimeout(() => {
-              timedOut = true;
-              reject(new Error(`Timed out after ${timeoutSec}s`));
-            }, timeoutSec * 1000),
-          ),
-        ])
-      : await task;
+    const invokeOnce = () =>
+      invokeReviewModel(llmProvider, messages, {
+        bedrockModel,
+        awsRegion,
+        ollamaModel,
+        ollamaBaseUrl,
+      });
+    const response =
+      timeoutSec > 0
+        ? await Promise.race([
+            invokeOnce(),
+            new Promise((_, reject) =>
+              setTimeout(() => {
+                timedOut = true;
+                reject(new Error(`Timed out after ${timeoutSec}s`));
+              }, timeoutSec * 1000),
+            ),
+          ])
+        : await invokeOnce();
     modelText = normalizeModelTextContent(response.content);
     process.stdout.write(`${modelText}\n`);
   } catch (err) {
@@ -621,6 +694,7 @@ async function main() {
   const reportMd = buildReportMarkdown({
     reviewedPath: repoDir,
     sourceLabel,
+    llmBackend: llmBackendLabel,
     exitCode: modelExitCode,
     signal: timedOut ? "SIGTERM" : null,
     stdout: stripAnsi(modelText),
@@ -651,6 +725,7 @@ async function main() {
           prBase: values["pr-base"],
           prTitle: values["pr-title"],
           prFileInRepo,
+          reviewEngineSummary: `LangChain (${llmBackendLabel})`,
         });
         prCreated = true;
       } catch (e) {

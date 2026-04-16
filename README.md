@@ -1,18 +1,36 @@
 # code-review-node
 
-CLI Node.js qui **clone un repository Git** (ou utilise un dossier local) et lance une **revue de code IA** via **[Kiro CLI](https://kiro.dev/docs/cli/)** (AWS Kiro) depuis la racine du projet. Le prompt par defaut cible les codebases **Node.js**.
+CLI Node.js qui **clone un repository Git** (ou utilise un dossier local) et lance une **revue de code IA** avec **LangChain**. Par défaut le modèle tourne **en local via [Ollama](https://ollama.com/)** (aucun compte AWS requis). Tu peux aussi utiliser **AWS Bedrock** (`LLM_PROVIDER=bedrock`) ou un mode **`stub`** pour tester le pipeline sans LLM. Le prompt par défaut cible les codebases **Node.js**.
 
-## Prerequis
+## Prérequis
 
 - **Node.js** 18+
-- **git** on your `PATH`
-- **Kiro CLI** installed and signed in — see [Kiro CLI installation](https://kiro.dev/docs/cli/installation/) and run `kiro-cli whoami` to confirm
+- **git** dans le `PATH`
+- **Ollama** installé et un modèle téléchargé (ex. `ollama pull llama3.2`) — pour la revue locale par défaut
+
+## Configuration (`.env`)
+
+```bash
+cp .env.example .env
+```
+
+Variables utiles (voir `.env.example` pour le détail) :
+
+| Variable | Rôle |
+|----------|------|
+| `LLM_PROVIDER` | `ollama` (défaut), `bedrock`, ou `stub` |
+| `OLLAMA_MODEL` | Nom du modèle Ollama (défaut : `llama3.2`) |
+| `OLLAMA_BASE_URL` | API Ollama (défaut : `http://127.0.0.1:11434`) |
+| `GITHUB_TOKEN` | Optionnel : utilisé avec `--github-pr` |
+
+Le fichier `.env` à la racine du projet est chargé automatiquement (même si tu lances la CLI depuis un autre répertoire).
 
 ## Installation
 
 ```bash
 git clone <this-repo-url>
 cd code-review-node
+npm ci
 ```
 
 ### Execution sans installation globale (recommande si `npm link` echoue)
@@ -200,25 +218,17 @@ Ce workflow permet de lancer le review sur **des repos externes** (pas seulement
 ### Ce que fait le job
 
 1. utilise un runner **self-hosted** (ta machine locale / ton serveur)
-2. vérifie `kiro-cli` + session (`kiro-cli whoami`) sur ce runner
-3. exécute `kiro-repo-review owner/repo --github-pr`
+2. vérifie qu’**Ollama** répond sur l’API HTTP (par défaut `http://127.0.0.1:11434`)
+3. exécute `kiro-repo-review --llm-provider ollama owner/repo --github-pr` (LangChain + modèle local)
 4. ouvre une PR dans le **repo ciblé** avec le rapport dans `docs/code-reviews/`
 
 Secrets à créer dans GitHub (repo → Settings → Secrets and variables → Actions):
 
 - `REVIEW_GITHUB_TOKEN`: PAT avec droits write (Contents + Pull requests) sur les repos à reviewer
 
-### Important: auth Kiro sur self-hosted runner
+### Important: Ollama sur le runner self-hosted
 
-Le workflow est configuré pour tourner sur `runs-on: [self-hosted]`.
-Tu dois installer Kiro CLI et faire le login **directement sur la machine runner**:
-
-```bash
-kiro-cli login
-kiro-cli whoami
-```
-
-Si `whoami` échoue dans le job, reconnecte Kiro sur la machine runner puis relance.
+Le workflow suppose **Ollama installé et démarré** sur la machine runner (même configuration qu’en local : `ollama pull llama3.2`, etc.). Si l’étape « Validate Ollama » échoue, lance l’app Ollama ou vérifie `curl http://127.0.0.1:11434/api/tags`.
 
 Exemples de déclenchement:
 

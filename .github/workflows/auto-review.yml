@@ -56,6 +56,20 @@ jobs:
         shell: bash
         run: npm ci
 
+      - name: Validate Ollama (LangChain local LLM)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Same default as the CLI (OLLAMA_BASE_URL in .env or http://127.0.0.1:11434)
+          base="${OLLAMA_BASE_URL:-http://127.0.0.1:11434}"
+          base="${base%/}"
+          if ! curl -fsS --max-time 5 "${base}/api/tags" >/dev/null; then
+            echo "Ollama is not reachable at ${base}."
+            echo "On the runner Mac: install Ollama, run 'ollama pull llama3.2', keep the app running."
+            exit 1
+          fi
+          echo "Ollama OK at ${base}"
+
       - name: Resolve target repo and options
         id: params
         shell: bash
@@ -112,7 +126,7 @@ jobs:
         shell: bash
         env:
           REVIEW_GITHUB_TOKEN: ${{ secrets.REVIEW_GITHUB_TOKEN }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
+          LLM_PROVIDER: ollama
           KIRO_REVIEW_GIT_NAME: code-review-bot
           KIRO_REVIEW_GIT_EMAIL: code-review-bot@users.noreply.github.com
           TARGET_REPO: ${{ steps.params.outputs.target_repo }}
@@ -125,13 +139,10 @@ jobs:
             echo "Missing secret REVIEW_GITHUB_TOKEN (PAT with Contents+PR write)."
             exit 1
           fi
-          if [ -z "${AWS_REGION:-}" ]; then
-            echo "Missing secret AWS_REGION (example: eu-west-1)."
-            exit 1
-          fi
 
           cmd=(
             node ./bin/kiro-repo-review.mjs
+            --llm-provider ollama
             --github-pr
             --github-token "$REVIEW_GITHUB_TOKEN"
             --pr-title "chore: automated code review (${SHA:0:7})"
